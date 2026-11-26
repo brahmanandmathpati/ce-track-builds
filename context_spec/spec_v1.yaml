@@ -1,0 +1,118 @@
+# NovaAssist Context Spec v1.0 (M1). Amends example_spec.yaml (v0.1); every later module amends this file.
+# Each change from the example is tied to a Lab A finding (autopsy_attribution.md) or a measurement
+# (labs/m1/runs, decision_records.md D-M1-01 / D-M1-02).
+#
+# The 12,000-token budget is a SIMULATED application-level budget, enforced by NovaAssist and independent
+# of the model's native window. It exists to create controlled budget pressure.
+
+spec_version: "1.0"
+agent: NovaAssist
+today: 2026-06-01            # the dataset reference date T0: "today" for every lab; never the system clock
+
+budget:
+  total_tokens: 12000
+  response_reserve: 1500     # unchanged: the longest persona format (P3) is about 250 words
+
+# Assembly order, top to bottom. Stable first, volatile last:
+#   system, tool_definitions : identical on every request, so they form a cacheable prefix
+#   state, memory            : durable facts about this session and user, before the narrative
+#   history                  : background narrative; older than the evidence below, so it must not outweigh it
+#   knowledge, tool_results  : the evidence for THIS question, adjacent to it, fresher than anything in history
+#   user_input               : last, closest to where the model starts answering
+# (Lab A #8: NovaBot put history next to the question and stale ticket copies sat beside the fresh one.)
+assembly_order: [system, tool_definitions, state, memory, history, knowledge, tool_results, user_input]
+
+overflow:
+  # When budgets collide, evict from these channels first (system and user_input are never evicted).
+  # Least reliable and most re-fetchable goes first; the smallest, highest-value channel goes last.
+  #   history          : stale copies, duplicated tool payloads (Lab A #8); the evidence below supersedes it
+  #   tool_results     : large (7,457 tokens in the autopsy, Lab A #10) and can be re-fetched by calling the tool again
+  #   knowledge        : the policy grounding whose absence caused the wrong answer, so it outlasts tool output
+  #   memory           : recalled facts, lower authority than a live record
+  #   tool_definitions : about 130 tokens in the autopsy, so evicting them frees almost nothing and disables tools
+  #   state            : tiny, and it carries the customer, ticket and version that history can lose
+  # Design commitment: M4 to M7 will enforce it; today only the per-channel budgets cut anything.
+  evict_order: [history, tool_results, knowledge, memory, tool_definitions, state]
+
+components:
+  system:
+    source: system_files
+    files:                    # versioned system-context files (relative to this spec)
+      - system/v1/role.md
+      - system/v1/grounding.md
+      - system/v1/conflicts.md
+      - system/v1/tone.md
+    priority: 0               # 0 = highest; never evicted
+    token_budget: 1200        # example 800. The four files measure 1,075 tokens (tiktoken o200k_base). Spent here
+                              # because 5 of the 13 Lab A findings (#1, #4, #6, #11, #12) are system-context gaps
+                              # (hardcoded SLA, authority, citation, persona, stale note). A cut deletes a rule.
+    freshness: null
+    selection: {}
+    compression: {method: none}
+    isolation: {enabled: false}
+
+  user_input:
+    source: request
+    priority: 1               # never evicted
+    token_budget: 500         # P-2 attaches two policy clauses: 248 tokens measured, so about 2x headroom
+    freshness: null
+    selection: {}
+    compression: {method: none}
+    isolation: {enabled: false}
+
+  history:
+    source: history_store
+    priority: 5               # first to be cut
+    token_budget: 1500        # example 2500. The 19 non-dump turns of the replayed conversation measure 1,371 tokens;
+                              # the three ticket dumps (6,953 each) can never fit and are re-fetchable by tool.
+    freshness: null
+    selection: {recent_turns: 24}   # example 6. At 6, T01 (the only turn naming Orbital, CUST-0001, TCK-1042) fell out
+                                    # while the budget used 149 of 2,500 tokens. A turn count is a poor limiter when
+                                    # turn sizes range from 8 to 6,953 tokens: the token budget does the limiting and
+                                    # recent_turns is only a ceiling (M5 replaces both with a real history policy).
+    compression: {method: none, trigger: null}
+    isolation: {enabled: false}
+
+  knowledge:
+    source: knowledge                      # chunk store + retrievers (Modules 2-4)
+    priority: 3
+    token_budget: 4000        # example 3500. Conflict answers need both policy documents plus the SLA clause, and the
+                              # autopsy's failure was the wrong source ranked first, not too many chunks.
+    freshness: {max_age_days: null, on_violation: flag}   # M2 sets real thresholds per document class
+    selection: {top_k: 6}     # example 8; fewer, better-ranked chunks. Authority order is in system/v1/conflicts.md
+    compression: {method: none, trigger: null}
+    isolation: {enabled: false}
+
+  tools:
+    source: mcp                            # MCP tool layer (Module 6)
+    priority: 4
+    token_budget: {definitions: 600, results: 1500}   # results stay at 1,500 on purpose: the autopsy's 7,457-token
+                                                      # ticket_detail result must be trimmed, not accommodated
+    freshness: null
+    selection: {max_tools: 4}  # the autopsy offered all 8 tools on every request, including ticket_create
+    compression: {method: none, trigger: null}
+    isolation: {enabled: false}
+
+  memory:
+    source: memory_store                   # memories + session-state summary share this budget (Module 5)
+    priority: 2
+    token_budget: 800         # example 1000. State is about 50 tokens, five memories about 300
+    freshness: {max_age_days: null, on_violation: flag}
+    selection: {max_memories: 5, min_confidence: null}
+    compression: {method: none, trigger: null}
+    isolation: {enabled: false}
+    # Session-state fields that must survive a long conversation (free-form key=value). The autopsy window had
+    # NO state, so the product version had to be dug out of 31k tokens of history and the answer got it wrong.
+    # These are facts that are cheap to hold, expensive to lose, and not recoverable once history is cut:
+    state_fields:
+      - persona          # P1 | P2 | P3: selects the answer format in tone.md
+      - customer         # CUST id and name, e.g. CUST-0001 Orbital Foods
+      - tier             # Standard | Premium | Elite, from the entitlement record, not from the question
+      - ticket           # active ticket id, e.g. TCK-1042
+      - severity         # the ticket's severity; response time depends on it
+      - product_version  # the customer's running version, e.g. NovaSync 2.3 (PV-107)
+      - advisory         # linked known issue, e.g. KI-2026-11
+      - task             # what the user is trying to do, so a topic change does not lose the thread
+
+economics:
+  ccu_per_1k: {prompt: 1.0, completion: 4.0}   # Course Cost Units: provisional, for relative comparison only
